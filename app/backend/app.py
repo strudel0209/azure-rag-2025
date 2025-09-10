@@ -8,6 +8,7 @@ import time
 from collections.abc import AsyncGenerator, Awaitable
 from pathlib import Path
 from typing import Any, Callable, Union, cast
+from telemetry_helper import get_telemetry
 
 from azure.cognitiveservices.speech import (
     ResultReason,
@@ -182,14 +183,43 @@ async def content_file(path: str, auth_claims: dict[str, Any]):
 async def ask(auth_claims: dict[str, Any]):
     if not request.is_json:
         return jsonify({"error": "request must be json"}), 415
+    
+    # Add telemetry tracking
+    start_time = time.time()
+    telemetry = get_telemetry()
+    
     request_json = await request.get_json()
     context = request_json.get("context", {})
     context["auth_claims"] = auth_claims
+    
     try:
+        # Extract query for telemetry
+        messages = request_json.get("messages", [])
+        query = ""
+        if messages and len(messages) > 0:
+            last_message = messages[-1]
+            if isinstance(last_message, dict) and "content" in last_message:
+                query = last_message["content"]
+        
         approach: Approach = cast(Approach, current_app.config[CONFIG_ASK_APPROACH])
         r = await approach.run(
             request_json["messages"], context=context, session_state=request_json.get("session_state")
         )
+        
+        # Track metrics (non-blocking)
+        duration_ms = (time.time() - start_time) * 1000
+        tokens = 0
+        if isinstance(r, dict) and "usage" in r:
+            tokens = r["usage"].get("total_tokens", 0)
+        
+        telemetry.track_request(
+            endpoint="ask",
+            user_id=auth_claims.get("oid", "anonymous"),
+            query=query,
+            tokens=tokens,
+            duration_ms=duration_ms
+        )
+        
         return jsonify(r)
     except Exception as error:
         return error_response(error, "/ask")
@@ -216,14 +246,26 @@ async def format_as_ndjson(r: AsyncGenerator[dict, None]) -> AsyncGenerator[str,
 async def chat(auth_claims: dict[str, Any]):
     if not request.is_json:
         return jsonify({"error": "request must be json"}), 415
+    
+    # Add telemetry tracking
+    start_time = time.time()
+    telemetry = get_telemetry()
+    
     request_json = await request.get_json()
     context = request_json.get("context", {})
     context["auth_claims"] = auth_claims
+    
     try:
+        # Extract query for telemetry
+        messages = request_json.get("messages", [])
+        query = ""
+        if messages and len(messages) > 0:
+            last_message = messages[-1]
+            if isinstance(last_message, dict) and "content" in last_message:
+                query = last_message["content"]
+        
         approach: Approach = cast(Approach, current_app.config[CONFIG_CHAT_APPROACH])
-
-        # If session state is provided, persists the session state,
-        # else creates a new session_id depending on the chat history options enabled.
+        
         session_state = request_json.get("session_state")
         if session_state is None:
             session_state = create_session_id(
@@ -235,6 +277,21 @@ async def chat(auth_claims: dict[str, Any]):
             context=context,
             session_state=session_state,
         )
+        
+        # Track metrics (non-blocking)
+        duration_ms = (time.time() - start_time) * 1000
+        tokens = 0
+        if isinstance(result, dict) and "usage" in result:
+            tokens = result["usage"].get("total_tokens", 0)
+        
+        telemetry.track_request(
+            endpoint="chat",
+            user_id=auth_claims.get("oid", "anonymous"),
+            query=query,
+            tokens=tokens,
+            duration_ms=duration_ms
+        )
+        
         return jsonify(result)
     except Exception as error:
         return error_response(error, "/chat")
@@ -393,6 +450,14 @@ async def list_uploaded(auth_claims: dict[str, Any]):
     adls_manager: AdlsBlobManager = current_app.config[CONFIG_USER_BLOB_MANAGER]
     files = await adls_manager.list_blobs(user_oid)
     return jsonify(files), 200
+
+
+@bp.route("/telemetry/stats", methods=["GET"])
+@authenticated
+async def telemetry_stats(auth_claims: dict[str, Any]):
+    """Get basic telemetry statistics - useful for testing"""
+    telemetry = get_telemetry()
+    return jsonify(telemetry.get_stats())
 
 
 @bp.before_app_serving

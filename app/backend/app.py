@@ -1303,7 +1303,11 @@ class MetricsStore:
             avg_latency = sum(self.request_latencies) / len(self.request_latencies) if self.request_latencies else 0
             most_frequent_query = max(self.query_counts.items(), key=lambda x: x[1])[0] if self.query_counts else "N/A"
             most_accessed_index = max(self.index_access_counts.items(), key=lambda x: x[1])[0] if self.index_access_counts else "N/A"
-            
+            # NEW: summarize semantic clusters (omit embeddings for size/privacy)
+            semantic_clusters_summary = [
+                {"rep": c["rep"], "count": c["count"]}
+                for c in self.semantic_clusters
+            ] if self.semantic_clusters else []
             return {
                 "total_tokens": self.total_tokens,
                 "prompt_tokens": self.prompt_tokens,
@@ -1314,7 +1318,9 @@ class MetricsStore:
                 "most_frequent_query": most_frequent_query,
                 "most_accessed_index": most_accessed_index,
                 "requests_by_endpoint": dict(self.requests_by_endpoint),
-                "top_token_users": sorted(self.tokens_by_user.items(), key=lambda x: x[1], reverse=True)[:10]
+                "top_token_users": sorted(self.tokens_by_user.items(), key=lambda x: x[1], reverse=True)[:10],
+                # NEW
+                "semantic_clusters": semantic_clusters_summary,
             }
 
 # Initialize metrics store

@@ -444,42 +444,73 @@ async def chat(auth_claims: dict[str, Any]):
 @bp.route("/chat/stream", methods=["POST"])
 @authenticated
 async def chat_stream(auth_claims: dict[str, Any]):
-	if not request.is_json:
-		return jsonify({"error": "request must be json"}), 415
-	request_json = await request.get_json()
-
-	# Debug-only raw request log
-	if os.environ.get("APP_LOG_LEVEL", "").upper() == "DEBUG" or os.environ.get("SHOW_ERRORS", "").lower() == "true":
-		current_app.logger.debug("Incoming /chat/stream JSON: %s", request_json)
-
-	try:
-		_validate_messages_payload(request_json)
-
-		context = request_json.get("context", {})
-		context["auth_claims"] = auth_claims
-
-		approach: Approach = cast(Approach, current_app.config[CONFIG_CHAT_APPROACH])
-
-		# If session state is provided, persists the session state,
-		# else creates a new session_id depending on the chat history options enabled.
-		session_state = request_json.get("session_state")
-		if session_state is None:
-			session_state = create_session_id(
-				current_app.config[CONFIG_CHAT_HISTORY_COSMOS_ENABLED],
-				current_app.config[CONFIG_CHAT_HISTORY_BROWSER_ENABLED],
-			)
-		result = await approach.run_stream(
-			request_json["messages"],
-			context=context,
-			session_state=session_state,
-		)
-		response = await make_response(format_as_ndjson(result))
-		response.timeout = None  # type: ignore
-		response.mimetype = "application/json-lines"
-		return response
-	except Exception as error:
-		current_app.logger.error("Error in /chat/stream endpoint: %s", str(error))
-		return error_response(error, "/chat")
+    # NEW: start timing + metrics for streaming (was missing)
+    start_time = time.time()
+    user_id = auth_claims.get("oid", "anonymous")
+    metrics_store.add_request("chat_stream", user_id)
+    request_counter.add(1, {"endpoint": "chat_stream", "user": user_id})
+    if not request.is_json:
+        return jsonify({"error": "request must be json"}), 415
+    request_json = await request.get_json()
+    if os.environ.get("APP_LOG_LEVEL", "").upper() == "DEBUG" or os.environ.get("SHOW_ERRORS", "").lower() == "true":
+        current_app.logger.debug("Incoming /chat/stream JSON: %s", request_json)
+    try:
+        _validate_messages_payload(request_json)
+        context = request_json.get("context", {})
+        context["auth_claims"] = auth_claims
+        approach: Approach = cast(Approach, current_app.config[CONFIG_CHAT_APPROACH])
+        session_state = request_json.get("session_state")
+        if session_state is None:
+            session_state = create_session_id(
+                current_app.config[CONFIG_CHAT_HISTORY_COSMOS_ENABLED],
+                current_app.config[CONFIG_CHAT_HISTORY_BROWSER_ENABLED],
+            )
+        # Start span manually to close when stream finishes
+        span = tracer.start_span("chat_stream_request")
+        span.set_attribute("user.id", user_id)
+        span.set_attribute("endpoint", "chat_stream")
+        span.set_attribute("model", os.environ.get("AZURE_OPENAI_CHATGPT_MODEL", "unknown"))
+        raw_stream = await approach.run_stream(
+            request_json["messages"],
+            context=context,
+            session_state=session_state,
+        )
+        # Wrapper generator to intercept usage + finalize metrics
+        async def instrument_stream():
+            try:
+                async for event in raw_stream:
+                    # If usage appears (added in approach), update metrics
+                    if "usage" in event:
+                        usage = event["usage"] or {}
+                        prompt_tokens = usage.get("prompt_tokens", 0)
+                        completion_tokens = usage.get("completion_tokens", 0)
+                        total_tokens = usage.get("total_tokens", prompt_tokens + completion_tokens)
+                        if total_tokens:
+                            metrics_store.add_tokens(
+                                prompt_tokens=prompt_tokens,
+                                completion_tokens=completion_tokens,
+                                total_tokens=total_tokens,
+                                user_id=user_id,
+                            )
+                            token_counter.add(total_tokens, {"endpoint": "chat_stream", "user": user_id})
+                            span.set_attribute("tokens.prompt", prompt_tokens)
+                            span.set_attribute("tokens.completion", completion_tokens)
+                            span.set_attribute("tokens.total", total_tokens)
+                    yield event
+            finally:
+                latency_ms = (time.time() - start_time) * 1000
+                metrics_store.add_latency(latency_ms)
+                latency_histogram.record(latency_ms, {"endpoint": "chat_stream", "status": "success"})
+                span.end()
+        response = await make_response(format_as_ndjson(instrument_stream()))
+        response.timeout = None  # type: ignore
+        response.mimetype = "application/json-lines"
+        return response
+    except Exception as error:
+        latency_ms = (time.time() - start_time) * 1000
+        latency_histogram.record(latency_ms, {"endpoint": "chat_stream", "status": "error"})
+        current_app.logger.error("Error in /chat/stream endpoint: %s", str(error))
+        return error_response(error, "/chat")
 
 
 # Send MSAL.js settings to the client UI
@@ -701,6 +732,10 @@ async def setup_clients():
                 else None
             )
 
+            # Search agent model/deployment used for retrieval agents (may be different from chat model)
+            AZURE_OPENAI_SEARCHAGENT_MODEL = os.environ.get("AZURE_OPENAI_SEARCHAGENT_MODEL")
+            AZURE_OPENAI_SEARCHAGENT_DEPLOYMENT = os.environ.get("AZURE_OPENAI_SEARCHAGENT_DEPLOYMENT")
+
             # -------- FIX: only use explicit custom URL, do NOT fall back to AZURE_OPENAI_ENDPOINT --------
             raw_custom = os.environ.get("AZURE_OPENAI_CUSTOM_URL")
             if raw_custom:
@@ -876,7 +911,7 @@ async def setup_clients():
                 # Setup approaches after OpenAI client is ready
                 if openai_client and search_client:
                     prompt_manager = PromptyManager()
-                    
+
                     ask_approach = RetrieveThenReadApproach(
                         search_client=search_client,
                         search_index_name=AZURE_SEARCH_INDEX,
@@ -884,8 +919,8 @@ async def setup_clients():
                         auth_helper=auth_helper,
                         chatgpt_model=OPENAI_CHATGPT_MODEL,
                         chatgpt_deployment=AZURE_OPENAI_CHATGPT_DEPLOYMENT,
-                        agent_model=OPENAI_CHATGPT_MODEL,
-                        agent_deployment=AZURE_OPENAI_CHATGPT_DEPLOYMENT,
+                        agent_model=AZURE_OPENAI_SEARCHAGENT_MODEL,
+                        agent_deployment=AZURE_OPENAI_SEARCHAGENT_DEPLOYMENT,
                         agent_client=agent_client if agent_client else None,
                         embedding_model=os.environ.get("AZURE_OPENAI_EMB_MODEL_NAME", "text-embedding-ada-002"),
                         embedding_deployment=AZURE_OPENAI_EMB_DEPLOYMENT,
@@ -898,7 +933,7 @@ async def setup_clients():
                         prompt_manager=prompt_manager,
                     )
                     current_app.config[CONFIG_ASK_APPROACH] = ask_approach
-                    
+
                     chat_approach = ChatReadRetrieveReadApproach(
                         search_client=search_client,
                         search_index_name=AZURE_SEARCH_INDEX,
@@ -906,8 +941,8 @@ async def setup_clients():
                         auth_helper=auth_helper,
                         chatgpt_model=OPENAI_CHATGPT_MODEL,
                         chatgpt_deployment=AZURE_OPENAI_CHATGPT_DEPLOYMENT,
-                        agent_model=OPENAI_CHATGPT_MODEL,
-                        agent_deployment=AZURE_OPENAI_CHATGPT_DEPLOYMENT,
+                        agent_model=AZURE_OPENAI_SEARCHAGENT_MODEL,
+                        agent_deployment=AZURE_OPENAI_SEARCHAGENT_DEPLOYMENT,
                         agent_client=agent_client if agent_client else None,
                         embedding_model=os.environ.get("AZURE_OPENAI_EMB_MODEL_NAME", "text-embedding-ada-002"),
                         embedding_deployment=AZURE_OPENAI_EMB_DEPLOYMENT,

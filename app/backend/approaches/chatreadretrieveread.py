@@ -131,13 +131,19 @@ class ChatReadRetrieveReadApproach(Approach):
         if overrides.get("suggest_followup_questions"):
             content, followup_questions = self.extract_followup_questions(content)
             extra_info.followup_questions = followup_questions
-        # Assume last thought is for generating answer
         if self.include_token_usage and extra_info.thoughts and chat_completion_response.usage:
             extra_info.thoughts[-1].update_token_usage(chat_completion_response.usage)
+        # NEW: expose usage so /ask and /chat endpoints can accumulate token metrics
+        usage_dict = (
+            chat_completion_response.usage.model_dump()
+            if chat_completion_response.usage and hasattr(chat_completion_response.usage, "model_dump")
+            else (chat_completion_response.usage.__dict__ if chat_completion_response.usage else {})
+        )
         chat_app_response = {
             "message": {"content": content, "role": role},
             "context": extra_info,
             "session_state": session_state,
+            "usage": usage_dict,  # <--- added
         }
         return chat_app_response
 
@@ -157,19 +163,15 @@ class ChatReadRetrieveReadApproach(Approach):
         followup_questions_started = False
         followup_content = ""
         async for event_chunk in await chat_coroutine:
-            # "2023-07-01-preview" API version has a bug where first response has empty choices
-            event = event_chunk.model_dump()  # Convert pydantic model to dict
+            event = event_chunk.model_dump()
             if event["choices"]:
-                # No usage during streaming
                 completion = {
                     "delta": {
                         "content": event["choices"][0]["delta"].get("content"),
                         "role": event["choices"][0]["delta"]["role"],
                     }
                 }
-                # if event contains << and not >>, it is start of follow-up question, truncate
-                content = completion["delta"].get("content")
-                content = content or ""  # content may either not exist in delta, or explicitly be None
+                content = completion["delta"].get("content") or ""
                 if overrides.get("suggest_followup_questions") and "<<" in content:
                     followup_questions_started = True
                     earlier_content = content[: content.index("<<")]
@@ -182,11 +184,21 @@ class ChatReadRetrieveReadApproach(Approach):
                 else:
                     yield completion
             else:
-                # Final chunk at end of streaming should contain usage
-                # https://cookbook.openai.com/examples/how_to_stream_completions#4-how-to-get-token-usage-data-for-streamed-chat-completion-response
+                # Final chunk - may contain usage
                 if event_chunk.usage and extra_info.thoughts and self.include_token_usage:
                     extra_info.thoughts[-1].update_token_usage(event_chunk.usage)
-                    yield {"delta": {"role": "assistant"}, "context": extra_info, "session_state": session_state}
+                    # Emit usage separately so the route can capture tokens
+                    usage_dict = (
+                        event_chunk.usage.model_dump()
+                        if hasattr(event_chunk.usage, "model_dump")
+                        else event_chunk.usage.__dict__
+                    )
+                    yield {
+                        "delta": {"role": "assistant"},
+                        "context": extra_info,
+                        "session_state": session_state,
+                        "usage": usage_dict,  # <--- added usage event
+                    }
 
         if followup_content:
             _, followup_questions = self.extract_followup_questions(followup_content)

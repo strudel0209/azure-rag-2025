@@ -146,6 +146,71 @@ class RetrieveThenReadApproach(Approach):
             "session_state": session_state,
         }
 
+    async def run_without_streaming(
+        self,
+        messages: list[ChatCompletionMessageParam],
+        overrides: dict[str, Any],
+        auth_claims: dict[str, Any],
+        session_state: Any = None,
+    ) -> dict[str, Any]:
+        q = messages[-1]["content"]
+        if not isinstance(q, str):
+            raise ValueError("The most recent message content must be a string.")
+
+        extra_info = await self.run_search_approach(messages, overrides, auth_claims)
+
+        # Process results
+        messages = self.prompt_manager.render_prompt(
+            self.answer_prompt,
+            self.get_system_prompt_variables(overrides.get("prompt_template"))
+            | {
+                "user_query": q,
+                "text_sources": extra_info.data_points.text,
+                "image_sources": extra_info.data_points.images or [],
+                "citations": extra_info.data_points.citations,
+            },
+        )
+
+        chat_completion_response = await self.create_chat_completion(
+            self.chatgpt_deployment,
+            self.chatgpt_model,
+            messages=messages,
+            overrides=overrides,
+            response_token_limit=self.get_response_token_limit(self.chatgpt_model, 1024),
+            stream=False,
+        )
+
+        answer_content = chat_completion_response.choices[0].message.content
+        role = chat_completion_response.choices[0].message.role
+
+        # Update token usage in thoughts
+        extra_info.thoughts = [
+            ThoughtStep(
+                title=thought.title,
+                input=thought.input,
+                params={
+                    **thought.params,
+                    "total_tokens": chat_completion_response.usage.total_tokens,
+                    "prompt_tokens": chat_completion_response.usage.prompt_tokens,
+                    "completion_tokens": chat_completion_response.usage.completion_tokens,
+                },
+            )
+            for thought in extra_info.thoughts
+        ]
+
+        # Expose usage in the non-streaming response
+        usage_dict = (
+            chat_completion_response.usage.model_dump()
+            if getattr(chat_completion_response, "usage", None) and hasattr(chat_completion_response.usage, "model_dump")
+            else (chat_completion_response.usage.__dict__ if getattr(chat_completion_response, "usage", None) else {})
+        )
+        return {
+            "message": {"content": answer_content, "role": role},
+            "context": extra_info,
+            "session_state": session_state,
+            "usage": usage_dict,
+        }
+
     async def run_search_approach(
         self, messages: list[ChatCompletionMessageParam], overrides: dict[str, Any], auth_claims: dict[str, Any]
     ) -> ExtraInfo:

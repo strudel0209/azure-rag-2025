@@ -3,6 +3,7 @@ import io
 import json
 import logging
 import mimetypes
+import math  # added for cosine similarity
 import os
 import time
 import traceback
@@ -456,6 +457,16 @@ async def chat_stream(auth_claims: dict[str, Any]):
         current_app.logger.debug("Incoming /chat/stream JSON: %s", request_json)
     try:
         _validate_messages_payload(request_json)
+
+        # --- NEW: track query + index access for streaming path ---
+        if request_json.get("messages"):
+            last_message = request_json["messages"][-1]
+            if last_message.get("content"):
+                metrics_store.add_query(str(last_message["content"]))
+        if index_name := os.environ.get("AZURE_SEARCH_INDEX"):
+            metrics_store.add_index_access(index_name)
+        # ----------------------------------------------------------
+
         context = request_json.get("context", {})
         context["auth_claims"] = auth_claims
         approach: Approach = cast(Approach, current_app.config[CONFIG_CHAT_APPROACH])
@@ -955,7 +966,16 @@ async def setup_clients():
                         prompt_manager=prompt_manager,
                     )
                     current_app.config[CONFIG_CHAT_APPROACH] = chat_approach
-                    
+                    # --- FIXED: semantic clustering enable block (indent + safety) ---
+                    try:
+                        metrics_store.configure_embeddings(
+                            openai_client,
+                            os.environ.get("AZURE_OPENAI_EMB_MODEL_NAME", "text-embedding-ada-002")
+                        )
+                        current_app.logger.info("Semantic query clustering enabled for metrics.")
+                    except Exception:
+                        current_app.logger.warning("Failed to enable semantic query clustering (continuing).", exc_info=True)
+                # -----------------------------------------------------------------
             except Exception:
                 current_app.logger.exception("Failed setting up OpenAI client and approaches")
 
@@ -1175,7 +1195,12 @@ class MetricsStore:
         self.last_reset = datetime.now()
         self.requests_by_endpoint = defaultdict(int)
         self.tokens_by_user = defaultdict(int)
-    
+        # --- NEW (semantic query clustering) ---
+        self.embedding_fun = None          # coroutine: (text) -> list[float]
+        self.semantic_clusters = []        # list[dict]: {"rep": str, "embedding": list[float], "count": int}
+        self.semantic_threshold = 0.85     # cosine similarity threshold
+        # ---------------------------------------
+
     def add_tokens(self, prompt_tokens=0, completion_tokens=0, total_tokens=0, user_id=None):
         with self.lock:
             self.prompt_tokens += prompt_tokens
@@ -1191,12 +1216,76 @@ class MetricsStore:
             if user_id:
                 self.unique_users.add(user_id)
     
-    def add_query(self, query):
+    # --- NEW helper to enable embeddings after OpenAI client is ready ---
+    def configure_embeddings(self, openai_client, emb_model_name: str):
+        """
+        Configure the async embedding function. Safe to call multiple times.
+        """
+        async def _embed(text: str):
+            if not text:
+                return None
+            try:
+                resp = await openai_client.embeddings.create(
+                    model=emb_model_name,
+                    input=[text]
+                )
+                return resp.data[0].embedding
+            except Exception:
+                logging.debug("Embedding failed; falling back to literal counting", exc_info=True)
+                return None
+        self.embedding_fun = _embed
+
+    # --- NEW internal async processor for semantic clustering ---
+    async def _process_semantic(self, query: str):
+        if not self.embedding_fun:
+            return
+        emb = await self.embedding_fun(query)
+        if not emb:
+            # Fallback: literal normalization
+            normalized_query = query.lower().strip()[:100] if query else "empty"
+            with self.lock:
+                self.query_counts[normalized_query] += 1
+            return
+        # Compute cosine similarity against existing centroids
+        def _cos(a, b):
+            dot = sum(x*y for x, y in zip(a, b))
+            na = math.sqrt(sum(x*x for x in a))
+            nb = math.sqrt(sum(x*x for x in b))
+            if na == 0 or nb == 0:
+                return 0.0
+            return dot / (na * nb)
+
         with self.lock:
-            # Normalize and truncate query for storage
+            best = None
+            best_sim = 0.0
+            for c in self.semantic_clusters:
+                sim = _cos(emb, c["embedding"])
+                if sim > best_sim:
+                    best_sim = sim
+                    best = c
+            if best and best_sim >= self.semantic_threshold:
+                best["count"] += 1
+                rep = best["rep"]
+            else:
+                rep = query
+                self.semantic_clusters.append({"rep": rep, "embedding": emb, "count": 1})
+            # Count representative so existing metrics (most_frequent_query) still work
+            norm_rep = rep.lower().strip()[:100] if rep else "empty"
+            self.query_counts[norm_rep] += 1
+
+    def add_query(self, query):
+        # Modified: if embeddings configured, cluster asynchronously; else original logic
+        if not query:
+            return
+        if self.embedding_fun:
+            # Fire and forget semantic processing (does not block request)
+            asyncio.create_task(self._process_semantic(query))
+            return
+        # Original literal normalization path
+        with self.lock:
             normalized_query = query.lower().strip()[:100] if query else "empty"
             self.query_counts[normalized_query] += 1
-    
+
     def add_index_access(self, index_name):
         with self.lock:
             if index_name:

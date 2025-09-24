@@ -402,6 +402,14 @@ module appServicePlan 'core/host/appserviceplan.bicep' = if (deploymentTarget ==
 }
 
 var appEnvVariables = {
+  // --- New: identify the logical service for shared App Insights ---
+  AZURE_APP_SERVICE_NAME: !empty(backendServiceName)
+    ? backendServiceName
+    : (deploymentTarget == 'appservice'
+        ? '${abbrs.webSitesAppService}backend-${resourceToken}'
+        : '${abbrs.webSitesContainerApps}backend-${resourceToken}')
+  // Optional future use (left blank – runtime can fall back to WEBSITE_INSTANCE_ID if present)
+  AZURE_APP_INSTANCE_ID: ''
   AZURE_STORAGE_ACCOUNT: storage.outputs.name
   AZURE_STORAGE_CONTAINER: storageContainerName
   AZURE_SEARCH_INDEX: searchIndexName

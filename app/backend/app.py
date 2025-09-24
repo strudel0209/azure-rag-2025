@@ -278,7 +278,7 @@ async def ask(auth_claims: dict[str, Any]):
     
     # Track request
     metrics_store.add_request("ask", user_id)
-    request_counter.add(1, {"endpoint": "ask", "user": user_id})
+    request_counter.add(1, _metric_attrs({"endpoint": "ask", "user": user_id}))
     
     if not request.is_json:
         return jsonify({"error": "request must be json"}), 415
@@ -329,7 +329,7 @@ async def ask(auth_claims: dict[str, Any]):
                         total_tokens=total_tokens,
                         user_id=user_id
                     )
-                    token_counter.add(total_tokens, {"endpoint": "ask", "user": user_id})
+                    token_counter.add(total_tokens, _metric_attrs({"endpoint": "ask", "user": user_id}))
                     span.set_attribute("tokens.prompt", prompt_tokens)
                     span.set_attribute("tokens.completion", completion_tokens)
                     span.set_attribute("tokens.total", total_tokens)
@@ -337,15 +337,15 @@ async def ask(auth_claims: dict[str, Any]):
         # Track latency
         latency_ms = (time.time() - start_time) * 1000
         metrics_store.add_latency(latency_ms)
-        latency_histogram.record(latency_ms, {"endpoint": "ask", "status": "success"})
+        latency_histogram.record(latency_ms, _metric_attrs({"endpoint": "ask", "status": "success"}))
         
         return jsonify(r)
     except Exception as error:
         # Track failed request
-        request_counter.add(1, {"endpoint": "ask", "status": "error", "user": user_id})
+        request_counter.add(1, _metric_attrs({"endpoint": "ask", "status": "error", "user": user_id}))
         
         latency_ms = (time.time() - start_time) * 1000
-        latency_histogram.record(latency_ms, {"endpoint": "ask", "status": "error"})
+        latency_histogram.record(latency_ms, _metric_attrs({"endpoint": "ask", "status": "error"}))
         
         current_app.logger.error("Error in /ask endpoint: %s", str(error))
         return error_response(error, "/ask")
@@ -359,7 +359,7 @@ async def chat(auth_claims: dict[str, Any]):
     
     # Track request
     metrics_store.add_request("chat", user_id)
-    request_counter.add(1, {"endpoint": "chat", "user": user_id})
+    request_counter.add(1, _metric_attrs({"endpoint": "chat", "user": user_id}))
     
     if not request.is_json:
         return jsonify({"error": "request must be json"}), 415
@@ -421,7 +421,7 @@ async def chat(auth_claims: dict[str, Any]):
                         total_tokens=total_tokens,
                         user_id=user_id
                     )
-                    token_counter.add(total_tokens, {"endpoint": "chat", "user": user_id})
+                    token_counter.add(total_tokens, _metric_attrs({"endpoint": "chat", "user": user_id}))
                     span.set_attribute("tokens.prompt", prompt_tokens)
                     span.set_attribute("tokens.completion", completion_tokens)
                     span.set_attribute("tokens.total", total_tokens)
@@ -429,14 +429,14 @@ async def chat(auth_claims: dict[str, Any]):
         # Track latency
         latency_ms = (time.time() - start_time) * 1000
         metrics_store.add_latency(latency_ms)
-        latency_histogram.record(latency_ms, {"endpoint": "chat", "status": "success"})
+        latency_histogram.record(latency_ms, _metric_attrs({"endpoint": "chat", "status": "success"}))
         
         return jsonify(result)
     except Exception as error:
-        request_counter.add(1, {"endpoint": "chat", "status": "error", "user": user_id})
+        request_counter.add(1, _metric_attrs({"endpoint": "chat", "status": "error", "user": user_id}))
         
         latency_ms = (time.time() - start_time) * 1000
-        latency_histogram.record(latency_ms, {"endpoint": "chat", "status": "error"})
+        latency_histogram.record(latency_ms, _metric_attrs({"endpoint": "chat", "status": "error"}))
         
         current_app.logger.error("Error in /chat endpoint: %s", str(error))
         return error_response(error, "/chat")
@@ -449,7 +449,7 @@ async def chat_stream(auth_claims: dict[str, Any]):
     start_time = time.time()
     user_id = auth_claims.get("oid", "anonymous")
     metrics_store.add_request("chat_stream", user_id)
-    request_counter.add(1, {"endpoint": "chat_stream", "user": user_id})
+    request_counter.add(1, _metric_attrs({"endpoint": "chat_stream", "user": user_id}))
     if not request.is_json:
         return jsonify({"error": "request must be json"}), 415
     request_json = await request.get_json()
@@ -503,7 +503,7 @@ async def chat_stream(auth_claims: dict[str, Any]):
                                 total_tokens=total_tokens,
                                 user_id=user_id,
                             )
-                            token_counter.add(total_tokens, {"endpoint": "chat_stream", "user": user_id})
+                            token_counter.add(total_tokens, _metric_attrs({"endpoint": "chat_stream", "user": user_id}))
                             span.set_attribute("tokens.prompt", prompt_tokens)
                             span.set_attribute("tokens.completion", completion_tokens)
                             span.set_attribute("tokens.total", total_tokens)
@@ -511,7 +511,7 @@ async def chat_stream(auth_claims: dict[str, Any]):
             finally:
                 latency_ms = (time.time() - start_time) * 1000
                 metrics_store.add_latency(latency_ms)
-                latency_histogram.record(latency_ms, {"endpoint": "chat_stream", "status": "success"})
+                latency_histogram.record(latency_ms, _metric_attrs({"endpoint": "chat_stream", "status": "success"}))
                 span.end()
         response = await make_response(format_as_ndjson(instrument_stream()))
         response.timeout = None  # type: ignore
@@ -519,7 +519,7 @@ async def chat_stream(auth_claims: dict[str, Any]):
         return response
     except Exception as error:
         latency_ms = (time.time() - start_time) * 1000
-        latency_histogram.record(latency_ms, {"endpoint": "chat_stream", "status": "error"})
+        latency_histogram.record(latency_ms, _metric_attrs({"endpoint": "chat_stream", "status": "error"}))
         current_app.logger.error("Error in /chat/stream endpoint: %s", str(error))
         return error_response(error, "/chat")
 
@@ -1176,6 +1176,20 @@ from datetime import datetime
 import threading
 from collections import defaultdict
 
+# Base metric attributes (service-level segregation)
+service_name_env = os.environ.get("AZURE_APP_SERVICE_NAME") or os.environ.get("WEBSITE_SITE_NAME") or "azure-search-openai-demo"
+service_instance_id = os.environ.get("AZURE_APP_INSTANCE_ID") or os.environ.get("WEBSITE_INSTANCE_ID") or ""
+base_metric_attrs = {
+    "service.name": service_name_env,
+}
+if service_instance_id:
+    base_metric_attrs["service.instance.id"] = service_instance_id
+
+def _metric_attrs(extra: dict[str, Any]) -> dict[str, Any]:
+    merged = dict(base_metric_attrs)
+    merged.update(extra)
+    return merged
+
 # Initialize OpenTelemetry instrumentation
 tracer = trace.get_tracer("azure-search-openai-demo", "1.0.0")
 meter = metrics.get_meter("azure-search-openai-demo", "1.0.0")
@@ -1350,32 +1364,32 @@ from opentelemetry.metrics import Observation  # Add this import at the top with
 
 # Then fix the callback functions:
 def _observe_total_tokens(options):
-    metrics_data = metrics_store.get_metrics()  # Renamed to avoid confusion
+    metrics_data = metrics_store.get_metrics()
     yield Observation(
-        metrics_data["total_tokens"], 
-        {"app": "azure-search-openai-demo", "type": "total"}
+        metrics_data["total_tokens"],
+        _metric_attrs({"type": "total"})
     )
     yield Observation(
-        metrics_data["prompt_tokens"], 
-        {"app": "azure-search-openai-demo", "type": "prompt"}
+        metrics_data["prompt_tokens"],
+        _metric_attrs({"type": "prompt"})
     )
     yield Observation(
-        metrics_data["completion_tokens"], 
-        {"app": "azure-search-openai-demo", "type": "completion"}
+        metrics_data["completion_tokens"],
+        _metric_attrs({"type": "completion"})
     )
 
 def _observe_unique_users(options):
     metrics_data = metrics_store.get_metrics()
     yield Observation(
-        metrics_data["unique_users_count"], 
-        {"app": "azure-search-openai-demo"}
+        metrics_data["unique_users_count"],
+        _metric_attrs({})
     )
 
 def _observe_average_latency(options):
     metrics_data = metrics_store.get_metrics()
     yield Observation(
-        metrics_data["average_latency_ms"], 
-        {"app": "azure-search-openai-demo"}
+        metrics_data["average_latency_ms"],
+        _metric_attrs({})
     )
 
 # Register observable gauges

@@ -117,13 +117,13 @@ jobs:
       RAG_SEND_IMAGE_SOURCES: ${{ vars.RAG_SEND_IMAGE_SOURCES }}
     steps:
       - name: Checkout
-        uses: actions/checkout@v5
+        uses: actions/checkout@v6
 
       - name: Install azd
-        uses: Azure/setup-azd@v2.2.0
+        uses: Azure/setup-azd@v2.2.1
 
       - name: Install Nodejs
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@v6
         with:
           node-version: 18
 
